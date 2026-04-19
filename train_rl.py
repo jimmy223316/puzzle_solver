@@ -244,8 +244,21 @@ def main(args):
     else:
         print("⚠️  未指定 BC 模型，從隨機初始化開始訓練")
 
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr,
-                            weight_decay=args.weight_decay)
+    # ------ 1.5 分離學習率 (Separate Learning Rates) ------
+    # - Backbone 和 Actor Head 已經訓練得很好，使用極小的學習率保護權重 (例如 5e-6)
+    # - Critic Head 是全新初始化的，需要較大的學習率趕快收斂 (例如 3e-4)
+    actor_params = []
+    critic_params = []
+    for name, param in model.named_parameters():
+        if "critic_head" in name:
+            critic_params.append(param)
+        else:
+            actor_params.append(param)
+
+    optimizer = optim.AdamW([
+        {"params": actor_params, "lr": args.actor_lr},
+        {"params": critic_params, "lr": args.critic_lr}
+    ], weight_decay=args.weight_decay)
 
     # ------ 2. 初始化環境與 Buffer ------
     env    = PuzzleRLEnv()
@@ -277,6 +290,20 @@ def main(args):
     print(f"{'='*70}\n")
 
     for update in range(1, args.total_updates + 1):
+        # ---- 0. 評論家預熱 (Critic Warm-up) ----
+        # 在初期階段，全新的 Critic 網路估計的 Advantage 會非常不準確，
+        # 如果一開始就全面更新，會導致原本很好的 Actor 被帶偏（策略崩潰）。
+        # 因此，在預熱期間，我們凍結 Backbone 和 Actor 的梯度，只允許更新 Critic。
+        is_warmup = update <= args.warmup_updates
+        for name, param in model.named_parameters():
+            if "critic_head" not in name:
+                param.requires_grad = not is_warmup
+
+        if is_warmup and update == 1:
+            print(f"  🔥 開始 Critic Warm-up：凍結 Actor 權重 (前 {args.warmup_updates} 次更新)，僅訓練 Critic！")
+        elif not is_warmup and update == args.warmup_updates + 1:
+            print(f"  🔓 解除凍結：預熱結束，Actor 權重加入訓練！")
+
         # ---- Curriculum 調整 ----
         progress = update / args.total_updates
         if progress < 0.30:
@@ -430,13 +457,15 @@ if __name__ == "__main__":
     parser.add_argument("--mini_batch_size",type=int,   default=256,                 help="Mini-batch 大小")
     parser.add_argument("--gamma",          type=float, default=0.99,                help="折扣因子")
     parser.add_argument("--gae_lambda",     type=float, default=0.95,                help="GAE lambda")
-    parser.add_argument("--clip_epsilon",   type=float, default=0.2,                 help="PPO clip 範圍")
+    parser.add_argument("--clip_epsilon",   type=float, default=0.1,                 help="PPO clip 範圍 (保險起見收緊為 0.1)")
     parser.add_argument("--value_coef",     type=float, default=0.5,                 help="Critic Loss 係數")
-    parser.add_argument("--entropy_coef",   type=float, default=0.02,               help="Entropy Bonus 係數")
+    parser.add_argument("--entropy_coef",   type=float, default=0.001,               help="Entropy Bonus 係數 (因已有完美 BC，調降為極小值)")
     parser.add_argument("--max_grad_norm",  type=float, default=0.5,                 help="梯度裁剪上限")
-    parser.add_argument("--lr",             type=float, default=3e-5,               help="學習率（比 BC 小 10 倍）")
+    parser.add_argument("--actor_lr",       type=float, default=5e-6,                help="Actor (預訓練) 學習率（極小）")
+    parser.add_argument("--critic_lr",      type=float, default=3e-4,                help="Critic (全新) 學習率（較大）")
+    parser.add_argument("--warmup_updates", type=int,   default=15,                  help="Critic 預熱階段的更新次數")
     parser.add_argument("--weight_decay",   type=float, default=1e-4,                help="Weight Decay")
     parser.add_argument("--log_interval",   type=int,   default=10,                  help="每隔幾次 update 印日誌")
-    parser.add_argument("--max_time_hours", type=float, default=0,                   help="最大訓練時間 (小時)，0=無限")
+    parser.add_argument("--max_time_hours", type=float, default=2.0,                   help="最大訓練時間 (小時)，0=無限")
     args = parser.parse_args()
     main(args)
