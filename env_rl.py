@@ -80,7 +80,7 @@ class PuzzleRLEnv:
         self.env.reset()
         self.state = self.env.get_state()
         self.step_count = 0
-        self.max_steps = self.n * self.n * 40  # 給充足探索空間
+        self.max_steps = self.n * self.n * 20  # 3x3=180步，夠用且不會拖太久
         self.prev_manhattan = self._manhattan(self.state, self.n)
         return self._encode(self.state, self.n)
 
@@ -100,8 +100,7 @@ class PuzzleRLEnv:
         # 確認合法性（非法動作直接給懲罰，不執行）
         legal = self.get_legal_actions()
         if action not in legal:
-            # 撞牆：small penalty，state 不變
-            return self._encode(self.state, self.n), -1.0, False, {
+            return self._encode(self.state, self.n), -0.5, False, {
                 "success": False, "steps": self.step_count, "n": self.n,
                 "illegal": True
             }
@@ -111,42 +110,30 @@ class PuzzleRLEnv:
         self.state = self.env.get_state()
         self.step_count += 1
 
-        # ---- 修改：密集獎勵邏輯 (Manhattan Progress) ----
-        curr_manhattan = self._calculate_manhattan()
-        diff = self.prev_manhattan - curr_manhattan
-        
-        # 1. 基礎時間懲罰 (強迫縮短步數)
-        step_penalty = -1.0
-        
-        # 2. 進度獎勵 (引導正確方向，但不能過強導致 AI 不敢暫時繞路)
-        if diff > 0:
-            progress_reward = 0.2    # 離目標更近
-        elif diff < 0:
-            progress_reward = -0.2   # 離目標更遠
-        else:
-            progress_reward = 0.0
-
-        self.prev_manhattan = curr_manhattan
-        reward = step_penalty + progress_reward
+        # ---- 極簡獎勵設計 ----
+        # 核心哲學：只用「步數懲罰 + 過關獎勵」
+        # 不使用曼哈頓距離進度獎勵！因為它會導致 AI 不敢繞路，
+        # 進而陷入局部最優，最終觸發 Entropy Collapse。
+        reward = -0.2   # 每步輕微懲罰（鼓勵縮短步數）
 
         done    = False
         success = False
 
         if self.env.is_solved():
-            # 過關大獎
-            reward  += 200.0
+            # 過關獎勵：+50 足以蓋過步數懲罰（50步 * -0.2 = -10）
+            # 留出空間讓 AI 學習用更少步數獲得更高總分
+            reward += 50.0
             done    = True
             success = True
         elif self.step_count >= self.max_steps:
-            # 超時懲罰
-            reward -= 10.0
+            reward -= 5.0
             done    = True
 
         info = {
             "success":   success,
             "steps":     self.step_count,
             "n":         self.n,
-            "manhattan": curr_manhattan,
+            "manhattan": self._calculate_manhattan(),
         }
         return self._encode(self.state, self.n), reward, done, info
 

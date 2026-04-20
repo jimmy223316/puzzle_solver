@@ -38,7 +38,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from model_rl import ActorCriticCNN, load_bc_weights
 from env_rl import PuzzleRLEnv
 
-torch.set_float32_matmul_precision('high')
+
 # =========================================================
 # Rollout Buffer
 # =========================================================
@@ -177,47 +177,44 @@ def ppo_update(model:         ActorCriticCNN,
         for start in range(0, T, mini_batch_size):
             b_idx = idx[start: start + mini_batch_size]
 
-            b_states      = buffer_data["states"][b_idx]         # (B, 3, 12, 12)
-            b_actions     = buffer_data["actions"][b_idx]        # (B,)
-            b_old_lp      = buffer_data["log_probs"][b_idx]      # (B,) 舊的 log_prob
-            b_legal_masks = buffer_data["legal_masks"][b_idx]    # (B, 4)
-            b_adv         = adv_norm[b_idx]                      # (B,)
-            b_returns     = returns[b_idx]                       # (B,)
+            b_states      = buffer_data["states"][b_idx]
+            b_actions     = buffer_data["actions"][b_idx]
+            b_old_lp      = buffer_data["log_probs"][b_idx]
+            b_legal_masks = buffer_data["legal_masks"][b_idx]
+            b_adv         = adv_norm[b_idx]
+            b_returns     = returns[b_idx]
 
-            # 用新的 policy 重新評估這批動作
             new_log_prob, entropy, new_value = model.evaluate_actions(
                 b_states, b_actions, b_legal_masks
             )
 
-            # PPO 比值 r_t = π_new / π_old
             log_ratio = new_log_prob - b_old_lp
             ratio = torch.exp(log_ratio)
 
-            # PPO Clip Loss（L_CLIP）
-            # 【重要】A > 0 時：鼓勵增大 r；A < 0 時：鼓勵縮小 r
-            # clip 限制更新幅度，避免策略突變
             surrogate1  = ratio * b_adv
             surrogate2  = torch.clamp(ratio, 1 - clip_epsilon, 1 + clip_epsilon) * b_adv
             pg_loss     = -torch.min(surrogate1, surrogate2).mean()
 
-            # Value Loss（L_VALUE，採用 Huber Loss / SmoothL1 以增強對極端 Advantage 的魯棒性）
             value_loss  = nn.functional.smooth_l1_loss(new_value, b_returns)
 
-            # Entropy Bonus（鼓勵探索）
-            entropy_loss = -entropy.mean()
+            # 🛡️【Entropy Floor 保護】：當 entropy 掉得太低時，強制加大探索係數
+            # 這防止了 Entropy Collapse - 一旦模型開始確定化，立刻給它一記警醒
+            current_entropy = entropy.mean().item()
+            effective_entropy_coef = entropy_coef
+            if current_entropy < 0.05:
+                effective_entropy_coef = entropy_coef * 3.0  # 三倍懲罰讓策略重新分散
 
-            # 總損失
-            total_loss = pg_loss + value_coef * value_loss + entropy_coef * entropy_loss
+            entropy_loss = -entropy.mean()
+            total_loss = pg_loss + value_coef * value_loss + effective_entropy_coef * entropy_loss
 
             optimizer.zero_grad()
             total_loss.backward()
-            # 梯度裁剪（PPO 的重要穩定技巧）
             nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
 
             stats["pg_loss"]    += pg_loss.item()
             stats["value_loss"] += value_loss.item()
-            stats["entropy"]    += (-entropy_loss).item()
+            stats["entropy"]    += current_entropy
             stats["total_loss"] += total_loss.item()
             n_batches += 1
 
@@ -238,6 +235,7 @@ def main(args):
 
     # ------ 1. 初始化模型與優化器 ------
     model = ActorCriticCNN().to(device)
+    
 
     if args.bc_model:
         model = load_bc_weights(model, args.bc_model, device)
@@ -467,18 +465,18 @@ if __name__ == "__main__":
     parser.add_argument("--rollout_steps",  type=int,   default=2048,                help="每次收集步數")
     parser.add_argument("--ppo_epochs",     type=int,   default=4,                   help="每批資料 PPO 更新次數")
     parser.add_argument("--mini_batch_size",type=int,   default=256,                 help="Mini-batch 大小")
-    parser.add_argument("--gamma",          type=float, default=0.999,               help="折扣因子 (調高以支援長期規劃)")
+    parser.add_argument("--gamma",          type=float, default=0.99,                help="折扣因子 (0.99 適合稀疏獎勵環境)")
     parser.add_argument("--gae_lambda",     type=float, default=0.95,                help="GAE lambda")
-    parser.add_argument("--clip_epsilon",   type=float, default=0.1,                 help="PPO clip 範圍 (保險起見收緊為 0.1)")
-    parser.add_argument("--value_coef",     type=float, default=1.0,                 help="Critic Loss 係數 (調高以強化價值預算)")
-    parser.add_argument("--entropy_coef",   type=float, default=0.02,                help="Entropy Bonus 係數 (調高以挽救探索能力，解決死迴圈)")
+    parser.add_argument("--clip_epsilon",   type=float, default=0.1,                 help="PPO clip 範圍")
+    parser.add_argument("--value_coef",     type=float, default=0.5,                 help="Critic Loss 係數")
+    parser.add_argument("--entropy_coef",   type=float, default=0.05,                help="Entropy Bonus 係數 (調高以防 Entropy Collapse)")
     parser.add_argument("--max_grad_norm",  type=float, default=0.5,                 help="梯度裁剪上限")
     parser.add_argument("--actor_lr",       type=float, default=5e-6,                help="Actor (預訓練) 學習率（極小）")
-    parser.add_argument("--critic_lr",      type=float, default=3e-4,                help="Critic (全新) 學習率（較大）")
-    parser.add_argument("--warmup_updates", type=int,   default=15,                  help="Critic 預熱階段的更新次數")
+    parser.add_argument("--critic_lr",      type=float, default=1e-4,                help="Critic (全新) 學習率（適中）")
+    parser.add_argument("--warmup_updates", type=int,   default=30,                  help="Critic 預熱階段的更新次數 (加長以保護 Actor)")
     parser.add_argument("--focus_size",     type=int,   default=3,                   help="強制指定單一尺寸進行訓練 (0=使用 Curriculum)")
     parser.add_argument("--weight_decay",   type=float, default=1e-4,                help="Weight Decay")
     parser.add_argument("--log_interval",   type=int,   default=10,                  help="每隔幾次 update 印日誌")
-    parser.add_argument("--max_time_hours", type=float, default=2.0,                   help="最大訓練時間 (小時)，0=無限")
+    parser.add_argument("--max_time_hours", type=float, default=6,                   help="最大訓練時間 (小時)，0=無限")
     args = parser.parse_args()
     main(args)
