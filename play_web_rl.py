@@ -100,8 +100,8 @@ def play_web_with_rl_ai(n: int, model_path: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="RL AI 網頁展示")
-    parser.add_argument("--size", type=int, default=3, help="盤面尺寸")
-    parser.add_argument("--model", type=str, default="best_rl_model_3x3.pth", help="RL 模型路徑")
+    parser.add_argument("--size", type=int, default=4, help="盤面尺寸")
+    parser.add_argument("--model", type=str, default="best_rl_model_30s.pth", help="RL 模型路徑")
     args = parser.parse_args()
     
     play_web_with_rl_ai(n=args.size, model_path=args.model)

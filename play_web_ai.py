@@ -105,8 +105,8 @@ def play_web_with_ai(n: int, model_path: str):
     if state == goal_state:
         print(f"\n🎉 震撼！AI 成功過關！總共花費了 {step_count} 步！")
         time.sleep(0.5)
-        # 觸發破紀錄輸入框
-        env.get_state(name=f"可達鴨_{n}x{n}")
+        # 留名青史
+        env.get_state(name=f"Psyduck_{n}x{n}")
     else:
         print(f"\n❌ AI 耗盡了體力 (超過 {max_steps} 步)。")
         print("可能原因：遇到了沒見過的複雜盤面，導致誤差累積陷入死迴圈。")

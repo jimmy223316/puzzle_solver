@@ -229,7 +229,8 @@ if __name__ == "__main__":
     if success:
         print("🎉 完美過關！")
         time.sleep(0.5)
-        env.get_state(name="可達鴨")
+        # 留名青史
+        env.get_state(name=f"Psyduck_{size}x{size}")
     else:
         print("❌ 解題失敗，可能卡住了。")
         

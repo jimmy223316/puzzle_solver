@@ -1,4 +1,4 @@
-# Psyduck-Solver (NeuralSlider) 🦆🧩
+# puzzle_solver (NeuralSlider) 🧩
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
@@ -6,9 +6,9 @@
 
 ## 專案簡介 / Project Overview
 
-**Psyduck-Solver** 是一個基於深度強化學習（Deep Reinforcement Learning）的高性能數字華容道（N-Puzzle）自動求解器。本專案結合了**行為複製（Behavioral Cloning）**與 **PPO 演算法**，旨在突破傳統演算法的限制，尋找 3x3 到 12x12 盤面的極限最短路徑。
+**puzzle_solver** 是一個基於深度強化學習（Deep Reinforcement Learning）的高性能數字華容道（N-Puzzle）自動求解器。本專案結合了**行為複製（Behavioral Cloning）**與 **PPO 演算法**，旨在突破傳統演算法的限制，尋找 3x3 到 12x12 盤面的極限最短路徑。
 
-**Psyduck-Solver** is a high-performance N-Puzzle (Sliding Puzzle) automated solver powered by Deep Reinforcement Learning. By combining **Behavioral Cloning (BC)** with the **Proximal Policy Optimization (PPO)** algorithm, this project aims to surpass traditional algorithmic constraints and discover optimal paths for puzzle sizes ranging from 3x3 up to 12x12.
+**puzzle_solver** is a high-performance N-Puzzle (Sliding Puzzle) automated solver powered by Deep Reinforcement Learning. By combining **Behavioral Cloning (BC)** with the **Proximal Policy Optimization (PPO)** algorithm, this project aims to surpass traditional algorithmic constraints and discover optimal paths for puzzle sizes ranging from 3x3 up to 12x12.
 
 ---
 
@@ -48,6 +48,12 @@ python train_rl.py --bc_model best_model.pth --focus_size 3 --total_updates 3000
 ```bash
 # 使用訓練好的 RL 模型在網頁上執行展示
 python play_web_rl.py --size 3 --model best_rl_model_3x3.pth
+```
+
+### 留名青史
+```python
+# 過關後自動登錄排行榜
+env.get_state(name=f"Psyduck_{n}x{n}")
 ```
 
 ---

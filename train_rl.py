@@ -29,6 +29,7 @@ train_rl.py — PPO 強化學習訓練腳本
 import argparse
 import time
 import math
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -37,7 +38,10 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from model_rl import ActorCriticCNN, load_bc_weights
 from env_rl import PuzzleRLEnv
+from subproc_vec_env import SubprocVecEnv
 
+# RTX 5060 Ti Tensor Core 加速：這行讓矩陣計算自動使用 TF32，在 Ampere+ 架構上可及 20~30% 加速
+torch.set_float32_matmul_precision('high')
 
 # =========================================================
 # Rollout Buffer
@@ -73,19 +77,19 @@ class RolloutBuffer:
         """將 buffer 資料轉成 PyTorch Tensor，回傳 dict。"""
         return {
             "states":      torch.tensor(np.array(self.states),
-                                        dtype=torch.float32, device=device),  # (T, 3, 12, 12)
-            "actions":     torch.tensor(self.actions,
-                                        dtype=torch.long,    device=device),  # (T,)
-            "log_probs":   torch.tensor(self.log_probs,
-                                        dtype=torch.float32, device=device),  # (T,)
-            "rewards":     torch.tensor(self.rewards,
-                                        dtype=torch.float32, device=device),  # (T,)
-            "values":      torch.tensor(self.values,
-                                        dtype=torch.float32, device=device),  # (T,)
-            "dones":       torch.tensor(self.dones,
-                                        dtype=torch.float32, device=device),  # (T,)
+                                        dtype=torch.float32, device=device),
+            "actions":     torch.tensor(np.array(self.actions),
+                                        dtype=torch.long,    device=device),
+            "log_probs":   torch.tensor(np.array(self.log_probs),
+                                        dtype=torch.float32, device=device),
+            "rewards":     torch.tensor(np.array(self.rewards),
+                                        dtype=torch.float32, device=device),
+            "values":      torch.tensor(np.array(self.values),
+                                        dtype=torch.float32, device=device),
+            "dones":       torch.tensor(np.array(self.dones),
+                                        dtype=torch.float32, device=device),
             "legal_masks": torch.tensor(np.array(self.legal_masks),
-                                        dtype=torch.bool,    device=device),  # (T, 4)
+                                        dtype=torch.bool,    device=device),
         }
 
 
@@ -95,46 +99,29 @@ class RolloutBuffer:
 def compute_gae(rewards: torch.Tensor,
                 values:  torch.Tensor,
                 dones:   torch.Tensor,
-                last_value: float,
+                last_value: torch.Tensor,
                 gamma: float = 0.99,
                 gae_lambda: float = 0.95) -> tuple:
     """
     計算 GAE (Generalized Advantage Estimation)。
-
-    公式：
-        δ_t = r_t + γ * V(s_{t+1}) * (1 - done_t) - V(s_t)
-        A_t = δ_t + (γλ) * A_{t+1}         ← 反向遞推
-
-    Args:
-        rewards:    (T,) 每步獎勵
-        values:     (T,) 每步的 V(s) 預測
-        dones:      (T,) 是否結束（float: 0 或 1）
-        last_value: 最後一步之後的 V(s_{T+1})（若已 done 則為 0）
-        gamma:      折扣因子
-        gae_lambda: GAE lambda
-
-    Returns:
-        advantages: (T,) 優勢估計（已正規化）
-        returns:    (T,) TD 目標值，用於訓練 Critic
     """
-    T = len(rewards)
-    advantages = torch.zeros(T, device=rewards.device)
+    T = rewards.shape[0]
+    num_envs = rewards.shape[1]
+    advantages = torch.zeros_like(rewards, device=rewards.device)
 
-    last_adv = 0.0
+    last_adv = torch.zeros(num_envs, device=rewards.device)
     for t in reversed(range(T)):
-        # next_value：若 t 是最後一步，用 last_value；否則用 values[t+1]
         next_value = values[t + 1] if t + 1 < T else last_value
         next_done  = dones[t]
 
-        # TD 殘差
         delta = rewards[t] + gamma * next_value * (1 - next_done) - values[t]
 
-        # GAE 反向遞推
         last_adv = delta + gamma * gae_lambda * (1 - next_done) * last_adv
         advantages[t] = last_adv
 
     returns = advantages + values  # V 目標值 = A + V_pred
-    return advantages, returns
+    # 回傳壓平的 tensor 給 PPO
+    return advantages.reshape(-1), returns.reshape(-1)
 
 
 # =========================================================
@@ -227,6 +214,9 @@ def ppo_update(model:         ActorCriticCNN,
 # =========================================================
 # 主訓練流程
 # =========================================================
+def make_env():
+    return PuzzleRLEnv()
+
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🖥️  使用裝置: {device}")
@@ -259,7 +249,8 @@ def main(args):
     ], weight_decay=args.weight_decay)
 
     # ------ 2. 初始化環境與 Buffer ------
-    env    = PuzzleRLEnv()
+    envs = [make_env for _ in range(args.num_envs)]
+    env = SubprocVecEnv(envs)
     buffer = RolloutBuffer()
 
     # ------ 3. 訓練統計 ------
@@ -273,6 +264,16 @@ def main(args):
     global_step  = 0
     global_start = time.time()
 
+    # 追蹤統計數據（用於畫圖）
+    history = {
+        "updates": [],
+        "rewards": [],
+        "lengths": [],
+        "v_loss":  [],
+        "pg_loss": [],
+        "success": []
+    }
+
     # 初始 reset
     curriculum_stage = "easy"
     if args.focus_size > 0:
@@ -280,15 +281,15 @@ def main(args):
         print(f"  🎯 模式：指定尺寸訓練 (N={args.focus_size})")
     else:
         env.set_curriculum(curriculum_stage)
-        print(f"  📈 模式：Curriculum Learning 起始: {curriculum_stage} ({env.sizes})")
+        print(f"  📈 模式：Curriculum Learning 起始: {curriculum_stage} ({PuzzleRLEnv.CURRICULUM[curriculum_stage]})")
     
     obs     = env.reset(n=args.focus_size if args.focus_size > 0 else None)
-    ep_reward = 0.0
+    ep_rewards = [0.0] * args.num_envs
 
     print(f"\n{'='*70}")
     print(f"🚀 開始 PPO 訓練 | 總更新次數: {args.total_updates} | "
           f"Rollout: {args.rollout_steps} steps")
-    print(f"   Curriculum 起始: {curriculum_stage} ({env.sizes})")
+    print(f"   Curriculum 起始: {curriculum_stage} ({PuzzleRLEnv.CURRICULUM[curriculum_stage]})")
     if args.max_time_hours > 0:
         print(f"   時間上限: {args.max_time_hours} 小時")
     print(f"{'='*70}\n")
@@ -318,58 +319,57 @@ def main(args):
             if stage != curriculum_stage:
                 curriculum_stage = stage
                 env.set_curriculum(stage)
-                print(f"  📈 課程升級 → {stage} ({env.sizes})")
+                print(f"  📈 課程升級 → {stage} ({PuzzleRLEnv.CURRICULUM[stage]})")
 
         # ---- A. 收集 Rollout ----
         buffer.clear()
-        model.eval()
+        
+        rollout_steps_per_env = args.rollout_steps // args.num_envs
 
-        for _ in range(args.rollout_steps):
-            # 編碼並轉成 Tensor
-            obs_tensor   = torch.tensor(obs, dtype=torch.float32,
-                                        device=device).unsqueeze(0)  # (1, 3, 12, 12)
-            legal_mask_np = env.get_legal_mask()
-            legal_mask_t  = torch.tensor(legal_mask_np, dtype=torch.bool,
-                                         device=device).unsqueeze(0)  # (1, 4)
+        with torch.inference_mode():
+            model.eval()
+            for _ in range(rollout_steps_per_env):
+                # 編碼並轉成 Tensor
+                obs_tensor   = torch.tensor(obs, dtype=torch.float32, device=device)  # (num_envs, 3, 12, 12)
+                legal_mask_np = env.get_legal_masks()
+                legal_mask_t  = torch.tensor(legal_mask_np, dtype=torch.bool, device=device)  # (num_envs, 4)
 
-            # 採樣動作
-            action, log_prob, entropy, value = model.get_action(obs_tensor, legal_mask_t)
-            action_int = action.item()
+                # 採樣動作 (Batch inference)
+                actions, log_probs, entropies, values = model.get_action(obs_tensor, legal_mask_t)
+                actions_np = actions.cpu().numpy()
 
-            # 執行一步
-            next_obs, reward, done, info = env.step(action_int)
-            ep_reward += reward
+                # 執行一步 (Asynchronous multiple envs)
+                next_obs, rewards, dones, infos = env.step(actions_np)
+                
+                for i in range(args.num_envs):
+                    ep_rewards[i] += rewards[i]
+                    if dones[i]:
+                        episode_rewards.append(ep_rewards[i])
+                        episode_lengths.append(infos[i]["steps"])
+                        episode_success.append(float(infos[i]["success"]))
+                        recent_rewards.append(ep_rewards[i])
+                        if len(recent_rewards) > 100:
+                            recent_rewards.pop(0)
+                        ep_rewards[i] = 0.0
 
-            # 存入 buffer
-            buffer.add(
-                state      = obs,
-                action     = action_int,
-                log_prob   = log_prob.item(),
-                reward     = reward,
-                value      = value.item(),
-                done       = float(done),
-                legal_mask = legal_mask_np,
-            )
+                # 存入 buffer
+                buffer.add(
+                    state      = obs,
+                    action     = actions_np,
+                    log_prob   = log_probs.cpu().numpy(),
+                    reward     = rewards,
+                    value      = values.cpu().numpy(),
+                    done       = dones.astype(np.float32),
+                    legal_mask = legal_mask_np,
+                )
 
-            global_step += 1
-            obs = next_obs
+                global_step += args.num_envs
+                obs = next_obs
 
-            if done:
-                episode_rewards.append(ep_reward)
-                episode_lengths.append(info["steps"])
-                episode_success.append(float(info["success"]))
-                recent_rewards.append(ep_reward)
-                if len(recent_rewards) > 100:
-                    recent_rewards.pop(0)
-                ep_reward = 0.0
-                obs = env.reset(n=args.focus_size if args.focus_size > 0 else None)
-
-        # ---- B. 計算最後一步的 V(s_T+1) ----
-        with torch.no_grad():
-            obs_tensor  = torch.tensor(obs, dtype=torch.float32,
-                                       device=device).unsqueeze(0)
-            _, last_val = model(obs_tensor)
-            last_value  = last_val.item() if not done else 0.0
+            # ---- B. 計算最後一步的 V(s_T+1) ----
+            obs_tensor  = torch.tensor(obs, dtype=torch.float32, device=device)
+            _, last_values_t = model(obs_tensor)
+            last_value = last_values_t.squeeze(-1)
 
         # ---- C. 轉 Tensor 並計算 GAE ----
         buf = buffer.to_tensors(device)
@@ -381,6 +381,12 @@ def main(args):
             gamma      = args.gamma,
             gae_lambda = args.gae_lambda,
         )
+
+        # 平展 buffer 中的各個欄位以供 PPO 更新使用
+        buf["states"]      = buf["states"].reshape(-1, 3, 12, 12)
+        buf["actions"]     = buf["actions"].reshape(-1)
+        buf["log_probs"]   = buf["log_probs"].reshape(-1)
+        buf["legal_masks"] = buf["legal_masks"].reshape(-1, 4)
 
         # ---- D. PPO 梯度更新 ----
         model.train()
@@ -437,6 +443,14 @@ def main(args):
                 }, args.rl_model)
                 print(f"    ⭐ 新最佳模型已存檔！MeanR={mean_r:.2f}")
 
+            # 記錄歷史數據
+            history["updates"].append(update)
+            history["rewards"].append(mean_r)
+            history["lengths"].append(mean_l)
+            history["v_loss"].append(stats["value_loss"])
+            history["pg_loss"].append(stats["pg_loss"])
+            history["success"].append(succ_r)
+
         # ---- F. 時間上限檢查 ----
         if args.max_time_hours > 0:
             elapsed_h = (time.time() - global_start) / 3600.0
@@ -456,15 +470,57 @@ def main(args):
         print(f"   最終成功率 (近100): {np.mean(episode_success[-100:])*100:.1f}%")
     print(f"   最佳模型存檔: {args.rl_model}")
 
+    # ------ 8. 繪製結果圖表 ------
+    if len(history["updates"]) > 0:
+        print("\n📊 正在生成訓練結果圖表...")
+        plt.figure(figsize=(15, 5))
+        
+        # Plot 1: Reward & Success
+        plt.subplot(1, 3, 1)
+        plt.title("Reward & Success Rate")
+        plt.plot(history["updates"], history["rewards"], label="Mean Reward", color="blue")
+        plt.xlabel("Updates")
+        plt.ylabel("Reward")
+        ax2 = plt.gca().twinx()
+        ax2.plot(history["updates"], history["success"], label="Success %", color="green", linestyle="--")
+        ax2.set_ylabel("Success Rate %")
+        plt.grid(True, alpha=0.3)
+        
+        # Plot 2: Loss
+        plt.subplot(1, 3, 2)
+        plt.title("Loss Scaling")
+        plt.plot(history["updates"], history["v_loss"], label="Value Loss", color="red")
+        plt.plot(history["updates"], history["pg_loss"], label="PG Loss", color="orange")
+        plt.yscale("log")
+        plt.xlabel("Updates")
+        plt.ylabel("Loss (Log Scale)")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # Plot 3: Mean Length
+        plt.subplot(1, 3, 3)
+        plt.title("Mean Episode Length")
+        plt.plot(history["updates"], history["lengths"], color="purple")
+        plt.xlabel("Updates")
+        plt.ylabel("Steps")
+        plt.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plot_path = "training_results.png"
+        plt.savefig(plot_path)
+        print(f"✅ 訓練圖表已存檔至: {plot_path}")
+        # 如果在有 GUI 的環境，可以考慮 plt.show()
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="華容道 PPO 強化學習訓練")
     parser.add_argument("--bc_model",       type=str,   default="best_model.pth",    help="BC 預訓練模型路徑")
     parser.add_argument("--rl_model",       type=str,   default="best_rl_model.pth", help="RL 最佳模型存檔路徑")
-    parser.add_argument("--total_updates",  type=int,   default=3000,                help="總 PPO 更新次數")
-    parser.add_argument("--rollout_steps",  type=int,   default=2048,                help="每次收集步數")
+    parser.add_argument("--num_envs",       type=int,   default=16,                  help="平行環境數量")
+    parser.add_argument("--total_updates",  type=int,   default=100000,              help="總 PPO 更新次數")
+    parser.add_argument("--rollout_steps",  type=int,   default=4096,                help="每次收集步數 (加大以提高 GPU 利用率)")
     parser.add_argument("--ppo_epochs",     type=int,   default=4,                   help="每批資料 PPO 更新次數")
-    parser.add_argument("--mini_batch_size",type=int,   default=256,                 help="Mini-batch 大小")
+    parser.add_argument("--mini_batch_size",type=int,   default=1024,                help="Mini-batch 大小 (加大以提高 GPU 利用率，16GB VRAM 夠用)")
     parser.add_argument("--gamma",          type=float, default=0.99,                help="折扣因子 (0.99 適合稀疏獎勵環境)")
     parser.add_argument("--gae_lambda",     type=float, default=0.95,                help="GAE lambda")
     parser.add_argument("--clip_epsilon",   type=float, default=0.1,                 help="PPO clip 範圍")
@@ -477,6 +533,6 @@ if __name__ == "__main__":
     parser.add_argument("--focus_size",     type=int,   default=3,                   help="強制指定單一尺寸進行訓練 (0=使用 Curriculum)")
     parser.add_argument("--weight_decay",   type=float, default=1e-4,                help="Weight Decay")
     parser.add_argument("--log_interval",   type=int,   default=10,                  help="每隔幾次 update 印日誌")
-    parser.add_argument("--max_time_hours", type=float, default=6,                   help="最大訓練時間 (小時)，0=無限")
+    parser.add_argument("--max_time_hours", type=float, default=20,                  help="最大訓練時間 (小時)，0=無限")
     args = parser.parse_args()
     main(args)
